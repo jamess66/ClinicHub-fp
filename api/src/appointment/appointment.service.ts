@@ -157,19 +157,27 @@ const createGoogleCalendarEvent = (
   TE.tryCatch(
     async () => {
       const dateTime = createDateTimeObject(date);
-      const response = await calendarService.createEvent({
-        ...dateTime,
-        description: symptom || "No description",
-      });
-      return { eventID: O.getOrElse(() => "")(O.fromNullable(response.eventID)) };
+      const response = await calendarService.createEvent({ ...dateTime, description: symptom || "No description" })();
+      return pipe(
+        response,
+        E.fold(
+          (error) => { throw new Error(error.error) },
+          (data) => ({ eventID: data.eventID || "" })
+        )
+      )
+
     },
     err => `Error creating calendar event: ${err}`
   )
 
-const deleteGoogleCalendarEvent = (eventId: string): TE.TaskEither<string, { message?: string | undefined; status?: number | undefined; } | void> =>
-  TE.tryCatch(
-    () => calendarService.deleteEvent(eventId),
-    err => `Error deleting calendar event: ${err}`
+const deleteGoogleCalendarEvent = (eventId: string): TE.TaskEither<string, { message?: string | undefined; status?: number | undefined; }> =>
+  pipe(
+    calendarService.deleteEvent(eventId),
+    TE.mapLeft(error => `Error deleting calendar event: ${error.error}`),
+    TE.chain(response =>
+      response.status === 200 ? TE.right(response) : TE.left(`Error deleting calendar event: ${response.error}`)
+    )
+
   );
 
 // region Utils

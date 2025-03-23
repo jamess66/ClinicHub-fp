@@ -1,119 +1,69 @@
-import { PrismaClient, Feedback } from "@prisma/client";
-import { pipe } from "fp-ts/function";
-import * as E from "fp-ts/Either";
-import * as TE from "fp-ts/TaskEither";
+import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
-// region Types
-type FeedbackResult<T> = { status: number; data?: T; error?: string };
-type ValidationResult = E.Either<string, boolean>;
+class FeedbackService {
+  async createFeedback(rating: number, comment: string) {
+    try {
+      // bad, moderate, good
+      if (!rating || rating < 1 || rating > 3) {
+        return { error: "Invalid rating value (must be 1-3)", status: 400 };
+      }
 
-// region Pure functions
-const validateRating = (rating: number): ValidationResult =>
-  rating >= 1 && rating <= 3
-    ? E.right(true)
-    : E.left("Invalid rating value (must be 1-3)");
-
-const mapErrorToStatus = (error: string): number => {
-  if (error === "Invalid rating value (must be 1-3)") return 400;
-  if (error === "Feedback not found") return 404;
-  return 500;
-};
-
-const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<FeedbackResult<T>> =>
-  pipe(
-    task,
-    TE.match(
-      (error: string): FeedbackResult<T> => ({ error, status: mapErrorToStatus(error) }),
-      (data: T): FeedbackResult<T> => ({ data, status: 200 })
-    )
-  )();
-
-// region Database operations
-const createFeedbackInDB = (rating: number, comment: string): TE.TaskEither<string, Feedback> =>
-  TE.tryCatch(
-    () =>
-      prisma.feedback.create({
+      const feedback = await prisma.feedback.create({
         data: {
           rating,
-          comment,
+          comment: comment,
         },
-      }),
-    (err) => `Error creating feedback: ${err}`
-  );
+      });
 
-const getAllFeedbackFromDB = (): TE.TaskEither<string, Feedback[]> =>
-  TE.tryCatch(
-    () =>
-      prisma.feedback.findMany({
+      return { data: feedback, status: 201 };
+    } catch (error) {
+      console.error("Error creating feedback:", error);
+      return { error: "Error creating feedback", status: 500 };
+    }
+  }
+
+  async getAllFeedback() {
+    try {
+      const feedbackList = await prisma.feedback.findMany({
         orderBy: { createdAt: "desc" },
-      }),
-    (err) => `Error fetching feedback: ${err}`
-  );
+      });
+      return { data: feedbackList, status: 200 };
+    } catch (error) {
+      return { error: "Error fetching feedback", status: 500 };
+    }
+  }
 
-const getFeedbackByRatingFromDB = (rating: number): TE.TaskEither<string, Feedback[]> =>
-  TE.tryCatch(
-    () =>
-      prisma.feedback.findMany({
+  async getFeedbackByRating(rating: number) {
+    try {
+      const feedbackList = await prisma.feedback.findMany({
         where: { rating: rating },
         orderBy: { createdAt: "desc" },
-      }),
-    (err) => `Error fetching feedback by rating: ${err}`
-  );
+      });
 
-const deleteFeedbackFromDB = (id: number): TE.TaskEither<string, void> =>
-  pipe(
-    TE.tryCatch(
-      () =>
-        prisma.feedback.delete({
-          where: { id },
-        }),
-      (err) => `Error deleting feedback: ${err}`
-    ),
-    TE.map(() => undefined)
-  );
+      return { data: feedbackList, status: 200 };
+    } catch (error) {
+      return { error: "Error fetching feedback by rating", status: 500 };
+    }
+  }
 
-const findFeedbackById = (id: number): TE.TaskEither<string, Feedback | null> =>
-  TE.tryCatch(
-    () => prisma.feedback.findUnique({ where: { id } }),
-    err => `Error finding feedback: ${err}`
-  );
+  async deleteFeedback(id: number) {
+    try {
+      const existingFeedback = await prisma.feedback.findUnique({
+        where: { id },
+      });
+      if (!existingFeedback) {
+        return { error: "Feedback not found", status: 404 };
+      }
 
-// region Service
-export const feedbackService = {
-  createFeedback: (rating: number, comment: string): Promise<FeedbackResult<Feedback>> =>
-    pipe(
-      rating,
-      validateRating,
-      TE.fromEither,
-      TE.chain(() => createFeedbackInDB(rating, comment)),
-      TE.mapLeft(error => error),
-      TE.map(data => data),
-      handleTaskResult
-    ),
+      await prisma.feedback.delete({ where: { id } });
+      return { message: "Feedback deleted successfully", status: 200 };
+    } catch (error) {
+      console.error("Error deleting feedback:", error);
+      return { error: "Error deleting feedback", status: 500 };
+    }
+  }
+}
 
-  getAllFeedback: (): Promise<FeedbackResult<Feedback[]>> =>
-    handleTaskResult(getAllFeedbackFromDB()),
-
-  getFeedbackByRating: (rating: number): Promise<FeedbackResult<Feedback[]>> =>
-    handleTaskResult(getFeedbackByRatingFromDB(rating)),
-
-  deleteFeedback: async (id: number): Promise<FeedbackResult<void>> => {
-    const result = await pipe(
-      findFeedbackById(id),
-      TE.chain(feedback =>
-        feedback ? TE.right(feedback) : TE.left("Feedback not found")
-      ),
-      TE.chain(() => deleteFeedbackFromDB(id))
-    )();
-
-    return pipe(
-      result,
-      E.fold(
-        (error) => ({ error, status: mapErrorToStatus(error) }),
-        (data) => ({ data, status: 200, error: "" })
-      )
-    );
-  },
-};
+export const feedbackService = new FeedbackService();
