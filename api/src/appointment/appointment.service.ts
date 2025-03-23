@@ -1,658 +1,604 @@
 import { Appointments, PrismaClient, Status, Prisma } from "@prisma/client";
 import { calendarService } from "../calendar/calendar.service";
+import { pipe, flow } from "fp-ts/function";
+import * as O from "fp-ts/Option";
+import * as E from "fp-ts/Either";
+import * as TE from "fp-ts/TaskEither";
+import * as A from "fp-ts/Array";
 
-class AppointmentService {
-  private prisma: PrismaClient;
+// region Types
+// Types
+type AppointmentResult<T> = { status: number; data?: T; error?: string }
 
-  constructor() {
-    this.prisma = new PrismaClient();
-  }
+type GoogleCalendarResult = { eventID: string };
 
-  private isChanged(dbdata: Appointments, newData: Appointments): boolean {
-    try {
-      if (!dbdata || !newData) {
-        return true;
-      }
+type ValidationResult = E.Either<string, boolean>;
 
-      const fields = [
-        "firstname",
-        "lastname",
-        "phone_number",
-        "appointment_dateTime",
-        "symptom",
-        "appointment_status",
-      ] as (keyof Appointments)[];
+type AppointmentFields = (keyof Appointments)[];
 
-      for (const field of fields) {
-        if (dbdata[field] !== newData[field]) {
-          return true;
-        }
-      }
+// region Constants
+// Constants
+const APPOINTMENT_FIELDS: AppointmentFields = [
+  "firstname",
+  "lastname",
+  "phone_number",
+  "appointment_dateTime",
+  "symptom",
+  "appointment_status",
+];
 
-      return false;
-    } catch (error) {
-      console.error("Error checking if appointment has changed:", error);
-      return true;
-    }
-  }
+const TIME_SLOT_VALIDATORS = [
+  (d: Date) => !isNaN(d.getTime()),
+  (d: Date) => d > new Date(),
+  (d: Date) => d.getMinutes() % 15 === 0,
+];
 
-  private validateTimeSlot(date: string, required: boolean): boolean {
-    try {
-      if (!date) {
-        return !required;
-      }
+// region Pure functions
+// Pure functions for validation
+export const isDefined = (value: any): boolean =>
+  value !== undefined && value !== null && value !== '';
 
-      const todayTime = new Date();
-      const selectedTime = new Date(date);
+const validateRequiredFields = (...fields: any[]): ValidationResult =>
+  fields.every(isDefined)
+    ? E.right(true)
+    : E.left("Missing required fields");
 
-      if (isNaN(selectedTime.getTime())) {
-        return false;
-      }
+const isValidDateFormat = (date: string): boolean =>
+  /^(?:\d{4}|\d{4}-\d{2}|\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3})$/.test(date);
 
-      return selectedTime > todayTime && selectedTime.getMinutes() % 15 == 0;
-    } catch (error) {
-      console.error("Error checking time slot:", error);
-      return false;
-    }
-  }
+const createDateValidator = (required: boolean) => (date: string): ValidationResult =>
+  !isDefined(date) && !required
+    ? E.right(true)
+    : pipe(
+      O.fromPredicate(isDefined)(date),
+      O.map(d => new Date(d)),
+      O.map(d => TIME_SLOT_VALIDATORS.every(pred => pred(d))),
+      O.getOrElse(() => false),
+      valid => valid ? E.right(true) : E.left("Invalid time slot")
+    );
 
-  private async checkAddableAppointment(
-    date: string,
-    id: number,
-    required: boolean
-  ): Promise<boolean> {
-    if (!date) {
-      return !required;
-    }
+const isFieldChanged = (dbData: Appointments) => (newData: Appointments): boolean =>
+  APPOINTMENT_FIELDS.some(field => dbData[field] !== newData[field]);
 
-    try {
-      const checkBooking = await this.prisma.appointments.findMany({
+// Pure functions for data transformation
+const formatAppointmentData = (appointment: Appointments) => ({
+  id: appointment.id,
+  firstname: appointment.firstname,
+  lastname: appointment.lastname,
+  phone_number: appointment.phone_number,
+  symptom: appointment.symptom,
+  appointment_dateTime: appointment.appointment_dateTime,
+  appointment_status: Status[appointment.appointment_status] as string,
+});
+
+const createDateTimeObject = (dateStr: string) => {
+  const date = new Date(dateStr);
+  return {
+    year: date.getFullYear(),
+    month: date.getMonth() + 1,
+    day: date.getDate(),
+    hour: date.getHours(),
+    minute: date.getMinutes(),
+  };
+};
+
+// region Database
+// Database operations
+const prisma = new PrismaClient();
+
+const findAppointmentsByDate = (date: string): TE.TaskEither<string, { appointment_dateTime: string }[]> =>
+  TE.tryCatch(
+    () => prisma.appointments.findMany({
+      select: { appointment_dateTime: true },
+      where: {
+        appointment_dateTime: { contains: date },
+        appointment_status: { not: Status.CANCELED },
+      },
+      orderBy: { appointment_dateTime: "asc" },
+    }),
+    err => `Error while fetching appointment time slot: ${err}`
+  );
+
+const findAppointmentByTimeSlot = (date: string, id: number): TE.TaskEither<string, boolean> =>
+  TE.tryCatch(
+    async () => {
+      if (!date) return true;
+
+      const checkBooking = await prisma.appointments.findMany({
         where: {
           appointment_dateTime: date,
           NOT: {
             appointment_status: Status.CANCELED,
           },
         },
-        orderBy: {
-          appointment_dateTime: "asc",
-        },
       });
 
-      if (
-        checkBooking.length > 0 &&
-        checkBooking.some((booking) => booking.id != id)
-      ) {
-        return false;
-      }
+      return !(checkBooking.length > 0 && checkBooking.some(booking => booking.id != id));
+    },
+    err => `Error checking existing appointment: ${err}`
+  );
 
-      return true;
-    } catch (error: any) {
-      return false;
-    }
-  }
+const findAppointmentById = (id: number): TE.TaskEither<string, Appointments | null> =>
+  TE.tryCatch(
+    () => prisma.appointments.findUnique({ where: { id } }),
+    err => `Error finding appointment: ${err}`
+  );
 
-  private async createGoogleCalendar(
-    date: string,
-    symptom: string
-  ): Promise<{
-    isCreated: boolean;
-    eventID: string | undefined;
-    cError: string | undefined;
-  }> {
-    try {
-      const dateTime = new Date(date);
+const findAppointmentByParams = (params: Prisma.AppointmentsWhereInput): TE.TaskEither<string, Appointments[]> =>
+  TE.tryCatch(
+    () => prisma.appointments.findMany({
+      where: params,
+      orderBy: { appointment_dateTime: "asc" },
+    }),
+    err => `Error finding appointments: ${err}`
+  );
+
+const createAppointment = (data: Prisma.AppointmentsCreateInput): TE.TaskEither<string, Appointments> =>
+  TE.tryCatch(
+    () => prisma.appointments.create({ data }),
+    err => `Error creating appointment: ${err}`
+  );
+
+const updateAppointment = (
+  id: number,
+  data: Prisma.AppointmentsUpdateInput
+): TE.TaskEither<string, Appointments> =>
+  TE.tryCatch(
+    () => prisma.appointments.update({ where: { id }, data }),
+    err => `Error updating appointment: ${err}`
+  );
+
+// region Google Calendar
+// Calendar operations
+const createGoogleCalendarEvent = (
+  date: string,
+  symptom: string
+): TE.TaskEither<string, GoogleCalendarResult> =>
+  TE.tryCatch(
+    async () => {
+      const dateTime = createDateTimeObject(date);
       const response = await calendarService.createEvent({
-        year: dateTime.getFullYear(),
-        month: dateTime.getMonth() + 1,
-        day: dateTime.getDate(),
-        hour: dateTime.getHours(),
-        minute: dateTime.getMinutes(),
+        ...dateTime,
         description: symptom || "No description",
       });
-      return { isCreated: true, eventID: response.eventID, cError: undefined };
-    } catch (error: any) {
-      console.log(error);
-      return { isCreated: false, eventID: undefined, cError: error };
-    }
+      return { eventID: O.getOrElse(() => "")(O.fromNullable(response.eventID)) };
+    },
+    err => `Error creating calendar event: ${err}`
+  )
+
+const deleteGoogleCalendarEvent = (eventId: string): TE.TaskEither<string, { message?: string | undefined; status?: number | undefined; } | void> =>
+  TE.tryCatch(
+    () => calendarService.deleteEvent(eventId),
+    err => `Error deleting calendar event: ${err}`
+  );
+
+// region Utils
+// Helper for handling TaskEither results
+const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<AppointmentResult<T>> =>
+  pipe(
+    task,
+    TE.match(
+      (error: string): AppointmentResult<T> => ({ error, status: 500 }),
+      (data: T): AppointmentResult<T> => ({ data, status: 200 })
+    )
+  )();
+
+// Custom error status mapping
+const mapErrorToStatus = (error: string): number => {
+  if (error === "Missing required fields" ||
+    error === "Invalid time slot" ||
+    error === "Validation failed") return 400;
+  if (error === "Appointment not found" ||
+    error === "No appointments found" ||
+    error === "Booking not found") return 404;
+  if (error === "No changes" ||
+    error === "Booking already canceled") return 304;
+  if (error === "Time slot already existing" ||
+    error === "Appointment canceled") return 400;
+  return 500;
+};
+
+// Helper for creating result from Either
+const createResultFromEither = <T>(either: E.Either<string, T>): AppointmentResult<T> => {
+  if (E.isLeft(either)) {
+    return { error: either.left, status: mapErrorToStatus(either.left) };
+  } else {
+    return { data: either.right, status: 200 };
   }
+};
 
-  async getAppointmentTimeSlot(date: string) {
-    if (!date) {
-      return { error: "Invalid date", status: 400 };
-    }
+// region Services
+// Main service functions
+export const appointmentService = {
+  // region getAppointmentTimeSlot
+  getAppointmentTimeSlot: (date: string): Promise<AppointmentResult<{ appointment_dateTime: string }[]>> =>
+    pipe(
+      date,
+      O.fromPredicate(d => isDefined(d) && isValidDateFormat(d)),
+      O.fold(
+        () => Promise.resolve({ error: "Invalid date", data: undefined, status: 400 }),
+        validDate => handleTaskResult(findAppointmentsByDate(validDate))
+      )
+    ),
 
-    try {
-      const appointments = await this.prisma.appointments.findMany({
-        select: {
-          appointment_dateTime: true,
-        },
-        where: {
-          appointment_dateTime: {
-            contains: date,
-          },
-          appointment_status: {
-            not: Status.CANCELED,
-          },
-        },
-        orderBy: {
-          appointment_dateTime: "asc",
-        },
-      });
-
-      if (!appointments) {
-        return { data: [], status: 200 };
-      }
-
-      return { data: appointments, status: 200 };
-    } catch (error) {
-      return {
-        error: "Error while fetching appointment time slot service: " + error,
-        status: 500,
-      };
-    }
-  }
-
-  async creteBooking(
+  // region createBooking
+  createBooking: async (
     firstname: string,
     lastname: string,
     phone_number: string,
     symptom: string,
     appointment_dateTime: string
-  ) {
-    if (
-      !firstname ||
-      !lastname ||
-      !phone_number ||
-      !symptom ||
-      !appointment_dateTime
-    ) {
-      return { error: "Missing required fields", status: 400 };
-    }
+  ): Promise<AppointmentResult<any>> => {
+    // Validation using composition
+    const validateInput = flow(
+      (): ValidationResult => validateRequiredFields(firstname, lastname, phone_number, symptom, appointment_dateTime),
+      E.chain(() => createDateValidator(true)(appointment_dateTime))
+    );
 
-    if (!this.validateTimeSlot(appointment_dateTime, true)) {
-      return { error: "Invalid time slot", status: 400 };
-    }
+    const checkTimeSlot = (): TE.TaskEither<string, boolean> =>
+      findAppointmentByTimeSlot(appointment_dateTime, -1);
 
-    try {
-      // Check existing appointment
-      const isAvailable = await this.checkAddableAppointment(
+    const createCalendarEntry = (): TE.TaskEither<string, { eventID: string }> =>
+      createGoogleCalendarEvent(appointment_dateTime, symptom);
+
+    const insertBooking = (eventID: string): TE.TaskEither<string, Appointments> =>
+      createAppointment({
+        eventId: eventID,
+        firstname,
+        lastname,
+        phone_number,
+        symptom,
         appointment_dateTime,
-        -1,
-        true
-      );
-      if (!isAvailable) {
-        return { error: "Time slot already existing", status: 400 };
-      }
-
-      // Create Google Calendar event
-      const { isCreated, eventID, cError } = await this.createGoogleCalendar(
-        appointment_dateTime,
-        symptom
-      );
-      if (!isCreated || !eventID) {
-        return {
-          error:
-            "Error while creating google calendar: " +
-            (cError || "unknown error"),
-          status: 500,
-        };
-      }
-
-      // Create booking on database
-      const booking = await this.prisma.appointments.create({
-        data: {
-          eventId: eventID,
-          firstname: firstname,
-          lastname: lastname,
-          phone_number: phone_number,
-          symptom: symptom,
-          appointment_dateTime: appointment_dateTime,
-          appointment_status: Status.PENDING,
-        },
+        appointment_status: Status.PENDING,
       });
 
-      // Return errer if failed to create booking
-      if (!booking) {
-        return { error: "Failed to create booking", status: 500 };
-      }
+    const result = await pipe(
+      validateInput(),
+      E.chain(() => E.right(undefined)),
+      TE.fromEither,
+      TE.chain(() => checkTimeSlot()),
+      TE.chain(available =>
+        available ? TE.right(undefined) : TE.left("Time slot already existing")
+      ),
+      TE.chain(() => createCalendarEntry()),
+      TE.chain(({ eventID }) =>
+        eventID ? insertBooking(eventID) : TE.left("Failed to create calendar event")
+      ),
+      TE.map(formatAppointmentData)
+    )();
 
-      // Construct return data
-      const constructedData = {
-        id: booking.id,
-        firstname: booking.firstname,
-        lastname: booking.lastname,
-        phone_number: booking.phone_number,
-        symptom: booking.symptom,
-        appointment_dateTime: booking.appointment_dateTime,
-        appointment_status: Status[booking.appointment_status] as string,
-      };
-      return { data: constructedData, status: 200 };
-    } catch (error) {
-      if (error instanceof Error) {
-        return {
-          error:
-            "Error while creating appointment service: " +
-            (error.message || error),
-          status: 500,
-        };
-      }
-      return { error: "An unexpected error occurred", status: 500 };
-    }
-  }
+    return pipe(
+      result,
+      E.fold(
+        error => ({ error, status: mapErrorToStatus(error) }),
+        data => ({ data, status: 200, error: '' })
+      )
+    );
+  },
 
-  async getDoctorAppointmentAll() {
-    try {
-      const appointments = await this.prisma.appointments.findMany({
-        orderBy: {
-          appointment_dateTime: "asc",
-        },
-      });
+  // region getDoctorAppointments
+  getDoctorAppointmentAll: async (): Promise<AppointmentResult<any[]>> => {
+    const getAppointments = TE.tryCatch(
+      () => prisma.appointments.findMany({
+        orderBy: { appointment_dateTime: "asc" },
+      }),
+      err => `Error fetching appointments: ${err}`
+    );
 
-      // Return error if no data found
-      if (!appointments || appointments.length <= 0) {
-        return { data: [], status: 200 };
-      }
+    return handleTaskResult(
+      pipe(
+        getAppointments,
+        TE.map(A.map(formatAppointmentData))
+      )
+    );
+  },
 
-      // Construct return data
-      const constructedData = appointments.map((appointment) => ({
-        id: appointment.id,
-        firstname: appointment.firstname,
-        lastname: appointment.lastname,
-        phone_number: appointment.phone_number,
-        symptom: appointment.symptom,
-        appointment_dateTime: appointment.appointment_dateTime,
-        appointment_status: Status[appointment.appointment_status] as string,
-      }));
-
-      return { data: constructedData, status: 200 };
-    } catch (error) {
-      if (error instanceof Error) {
-        return {
-          error:
-            "Error while fetching all doctor appointment service: " +
-            error.message,
-          status: 500,
-        };
-      }
-      return { error: "An unexpected error occurred", status: 500 };
-    }
-  }
-
-  async getDoctorAppointmentByParameter(
+  getDoctorAppointmentByParameter: async (
     date: string,
     firstname: string,
     lastname: string,
     status: string,
     phone_number: string,
-    id: number | undefined
-  ) {
-    try {
+    id?: number
+  ): Promise<AppointmentResult<Appointments[]>> => {
+    const buildWhereClause = (): Prisma.AppointmentsWhereInput => {
       const status_prisma = status
         ? Status[status.toUpperCase() as keyof typeof Status]
         : undefined;
-      const where: Prisma.AppointmentsWhereInput = {
-        appointment_dateTime: {
-          contains: date || "",
-        },
-        firstname: {
-          contains: firstname || "",
-        },
-        lastname: {
-          contains: lastname || "",
-        },
-        phone_number: {
-          contains: phone_number || "",
-        },
-        id: {
-          equals: id || undefined,
-        },
+
+      return {
+        ...(date && { appointment_dateTime: { contains: date } }),
+        ...(firstname && { firstname: { contains: firstname } }),
+        ...(lastname && { lastname: { contains: lastname } }),
+        ...(phone_number && { phone_number: { contains: phone_number } }),
+        ...(id && { id: { equals: id } }),
+        ...(status_prisma && { appointment_status: status_prisma }),
       };
+    };
 
-      if (status_prisma) {
-        where.appointment_status = status_prisma;
-      }
+    return handleTaskResult(findAppointmentByParams(buildWhereClause()));
+  },
 
-      const appointments = await this.prisma.appointments.findMany({
-        where,
-        orderBy: {
-          appointment_dateTime: "asc",
-        },
-      });
-
-      if (!appointments || appointments.length <= 0) {
-        return { data: [], status: 200 };
-      }
-
-      return { data: appointments, status: 200 };
-    } catch (error) {
-      if (error instanceof Error) {
-        return {
-          error:
-            "Error while fetching doctor appointment by parameters service: " +
-            error.message,
-          status: 500,
-        };
-      }
-      return { error: "An unexpected error occurred", status: 500 };
-    }
-  }
-
-  async updateDoctorAppointment(
+  // region updateBooking
+  updateDoctorAppointment: async (
     id: number,
     appointment_dateTime: string,
     status: string
-  ) {
-    // Check required id and one of status or datetime
-    if (!id || (!appointment_dateTime && !status)) {
-      return { error: "Missing required fields", status: 400 };
-    }
+  ): Promise<AppointmentResult<Appointments>> => {
+    // Validation using composition
+    const validateInput = flow(
+      (): ValidationResult => validateRequiredFields(id, appointment_dateTime, status),
+      E.chain(() => createDateValidator(false)(appointment_dateTime)),
+      E.chain(() =>
+        status && Status[status as keyof typeof Status] !== undefined
+          ? E.right(true)
+          : E.left("Invalid status")
+      )
+    );
 
-    // Check time slot
-    if (!this.validateTimeSlot(appointment_dateTime, false)) {
-      return { error: "Invalid time slot", status: 400 };
-    }
-
-    // Check appointment status
-    let appointment_status = undefined;
-    try {
-      appointment_status = Status[status as keyof typeof Status];
-    } catch (error) {
-      return { error: "Invalid status", status: 400 };
-    }
-
-    try {
-      // Check existing appointment
-      const checkBooking = await this.prisma.appointments.findUnique({
-        where: {
-          id: id,
-        },
-      });
-
-      if (!checkBooking) {
-        return { error: "Appointment not found", status: 404 };
-      }
-
-      // Check existing booking
-      const isAvailable = await this.checkAddableAppointment(
-        appointment_dateTime,
-        id,
-        false
+    const getExistingAppointment = (): TE.TaskEither<string, Appointments> =>
+      pipe(
+        findAppointmentById(id),
+        TE.chain(appointment =>
+          appointment ? TE.right(appointment) : TE.left("Appointment not found")
+        )
       );
-      if (!isAvailable) {
-        return { error: "Time slot already existing", status: 400 };
-      }
 
-      // Construct new data
+    const checkTimeSlotAvailability = (): TE.TaskEither<string, boolean> =>
+      appointment_dateTime
+        ? findAppointmentByTimeSlot(appointment_dateTime, id)
+        : TE.right(true);
+
+    const processAppointmentUpdate = (existingBooking: Appointments) => {
+      const newStatus = status ? Status[status as keyof typeof Status] : existingBooking.appointment_status;
+      const newDateTime = appointment_dateTime || existingBooking.appointment_dateTime;
+
       const newData: Appointments = {
-        ...checkBooking,
-        appointment_dateTime: appointment_dateTime,
-        appointment_status: appointment_status,
+        ...existingBooking,
+        appointment_dateTime: newDateTime,
+        appointment_status: newStatus,
       };
 
-      if (!this.isChanged(checkBooking, newData)) {
-        return { error: "No changes", status: 304 };
+      if (!isFieldChanged(existingBooking)(newData)) {
+        return TE.left("No changes");
       }
 
-      // create google calendar event
-      const { isCreated, eventID, cError } = await this.createGoogleCalendar(
-        appointment_dateTime,
-        checkBooking.symptom
+      return pipe(
+        createGoogleCalendarEvent(newDateTime, existingBooking.symptom),
+        TE.chain(eventID => eventID ? TE.right(eventID) : TE.left("Failed to create calendar event")),
+        TE.chain(({ eventID }) =>
+          existingBooking.eventId
+            ? pipe(
+              deleteGoogleCalendarEvent(existingBooking.eventId),
+              TE.map(() => eventID)
+            )
+            : TE.right(eventID)
+        ),
+        TE.chain(eventID =>
+          updateAppointment(id, {
+            appointment_dateTime: appointment_dateTime || undefined,
+            appointment_status: status ? Status[status as keyof typeof Status] : undefined,
+            eventId: eventID,
+          })
+        )
       );
+    };
 
-      if (!isCreated) {
-        return {
-          error:
-            "Error while creating google calendar: " +
-            (cError || "unknown error"),
-          status: 500,
-        };
-      }
+    const result = await pipe(
+      validateInput(),
+      TE.fromEither,
+      TE.chain(() => getExistingAppointment()),
+      TE.chain(existingBooking =>
+        pipe(
+          checkTimeSlotAvailability(),
+          TE.chain(isAvailable =>
+            isAvailable
+              ? TE.right(existingBooking)
+              : TE.left("Time slot already existing")
+          )
+        )
+      ),
+      TE.chain(processAppointmentUpdate)
+    )();
 
-      // Delete google calendar event
-      if (checkBooking.eventId && isCreated) {
-        await calendarService.deleteEvent(checkBooking.eventId);
-      }
+    return pipe(
+      result,
+      E.match(
+        (error): AppointmentResult<Appointments> => ({ error, status: mapErrorToStatus(error) }),
+        (data): AppointmentResult<Appointments> => ({ data, status: 200 })
+      )
+    );
+  },
 
-      const booking = await this.prisma.appointments.update({
-        where: { id },
-        data: {
-          appointment_dateTime: appointment_dateTime || undefined,
-          appointment_status: appointment_status || undefined,
-          eventId: eventID || undefined,
-        },
-      });
-
-      return { data: booking, status: 200 };
-    } catch (error) {
-      if (error instanceof Error) {
-        return {
-          error: "Error while updating doctor appointment service: " + error,
-          status: 500,
-        };
-      }
-      return { error: "An unexpected error occurred", status: 500 };
-    }
-  }
-
-  async getPatientAppointment(
+  // region getPatientAppointments
+  getPatientAppointment: async (
     phone_number: string,
     firstname: string,
     lastname: string
-  ) {
-    if (!phone_number || !firstname || !lastname) {
-      return { error: "Missing required fields", status: 400 };
+  ): Promise<AppointmentResult<Appointments[]>> => {
+    const validation = validateRequiredFields(phone_number, firstname, lastname);
+
+    if (E.isLeft(validation)) {
+      return createResultFromEither(validation);
     }
-    try {
-      const appointments = await this.prisma.appointments.findMany({
-        where: {
-          phone_number: phone_number,
-          firstname: firstname,
-          lastname: lastname,
-        },
-        orderBy: {
-          appointment_dateTime: "asc",
-        },
-      });
 
-      if (!appointments || appointments.length < 1) {
-        return { error: "No appointments found", status: 404 };
-      }
+    const result = await pipe(
+      findAppointmentByParams({ phone_number, firstname, lastname }),
+      TE.chain(appointments =>
+        appointments.length > 0
+          ? TE.right(appointments)
+          : TE.left("No appointments found")
+      )
+    )();
 
-      return { data: appointments, status: 200 };
-    } catch (error) {
-      if (error instanceof Error) {
-        return {
-          error:
-            "Error while fetching patient appointment service: " +
-            error.message,
-          status: 500,
-        };
-      }
-      return { error: "An unexpected error occurred", status: 500 };
-    }
-  }
+    return pipe(
+      result,
+      E.match(
+        (error): AppointmentResult<Appointments[]> => ({ error, status: mapErrorToStatus(error) }),
+        (data): AppointmentResult<Appointments[]> => ({ data, status: 200 })
+      )
+    );
+  },
 
-  async updatePatientAppointment(
+  // region updatePatient
+  updatePatientAppointment: async (
     id: number,
     firstname: string,
     lastname: string,
     phone_number: string,
     appointment_dateTime: string,
     symptom: string
-  ) {
-    if (
-      !id ||
-      (!appointment_dateTime &&
-        !symptom &&
-        !firstname &&
-        !lastname &&
-        !phone_number)
-    ) {
-      return { error: "Missing required fields", status: 400 };
-    }
+  ): Promise<AppointmentResult<Appointments>> => {
+    const hasUpdates = [firstname, lastname, phone_number, appointment_dateTime, symptom]
+      .some(isDefined);
 
-    // Check time slot
-    if (!this.validateTimeSlot(appointment_dateTime, false)) {
-      return { error: "Invalid time slot", status: 400 };
-    }
+    const validateInput = flow(
+      (): ValidationResult => id && hasUpdates
+        ? E.right(true)
+        : E.left("Missing required fields"),
+      E.chain(() => appointment_dateTime
+        ? createDateValidator(false)(appointment_dateTime)
+        : E.right(true)
+      )
+    );
 
-    try {
-      // Check existing appointment
-      const checkBooking = await this.prisma.appointments.findUnique({
-        where: {
-          id: id,
-        },
-      });
-
-      if (!checkBooking) {
-        return { error: "Appointment not found", status: 404 };
-      }
-
-      // Check existing booking
-      const isAvailable = await this.checkAddableAppointment(
-        appointment_dateTime,
-        id,
-        false
+    const getExistingAppointment = (): TE.TaskEither<string, Appointments> =>
+      pipe(
+        findAppointmentById(id),
+        TE.chain(appointment =>
+          appointment
+            ? TE.right(appointment)
+            : TE.left("Appointment not found")
+        ),
+        TE.chain(appointment =>
+          appointment.appointment_status === Status.CANCELED
+            ? TE.left("Appointment canceled")
+            : TE.right(appointment)
+        )
       );
-      if (!isAvailable) {
-        return { error: "Time slot already existing", status: 400 };
-      }
 
-      if (checkBooking.appointment_status == Status.CANCELED) {
-        return { error: "Appointment canceled", status: 400 };
-      }
-
-      // Construct new data
+    const processAppointmentUpdate = (existingBooking: Appointments) => {
       const newData: Appointments = {
-        id: checkBooking.id,
-        eventId: checkBooking.eventId,
-        firstname: firstname || checkBooking.firstname,
-        lastname: lastname || checkBooking.lastname,
-        phone_number: phone_number || checkBooking.phone_number,
-        appointment_dateTime:
-          appointment_dateTime || checkBooking.appointment_dateTime,
-        symptom: symptom || checkBooking.symptom,
-        appointment_status: checkBooking.appointment_status,
-        createdAt: checkBooking.createdAt,
-        updatedAt: checkBooking.updatedAt,
+        ...existingBooking,
+        firstname: firstname || existingBooking.firstname,
+        lastname: lastname || existingBooking.lastname,
+        phone_number: phone_number || existingBooking.phone_number,
+        appointment_dateTime: appointment_dateTime || existingBooking.appointment_dateTime,
+        symptom: symptom || existingBooking.symptom,
       };
 
-      if (!this.isChanged(checkBooking, newData)) {
-        return { error: "No changes", status: 304 };
+      if (!isFieldChanged(existingBooking)(newData)) {
+        return TE.left("No changes");
       }
 
-      // create google calendar event
-      const { isCreated, eventID, cError } = await this.createGoogleCalendar(
-        appointment_dateTime,
-        checkBooking.symptom
+      return pipe(
+        createGoogleCalendarEvent(newData.appointment_dateTime, newData.symptom),
+        TE.chain(eventID => eventID ? TE.right(eventID) : TE.left("Failed to create calendar event")),
+        TE.chain(({ eventID }) =>
+          existingBooking.eventId
+            ? pipe(
+              deleteGoogleCalendarEvent(existingBooking.eventId),
+              TE.map(() => eventID)
+            )
+            : TE.right(eventID)
+        ),
+        TE.chain(eventID =>
+          updateAppointment(id, {
+            ...newData,
+            eventId: eventID,
+          })
+        )
       );
+    };
 
-      if (!isCreated) {
-        return {
-          error:
-            "Error while creating google calendar: " +
-            (cError || "unknown error"),
-          status: 500,
-        };
-      }
+    const result = await pipe(
+      validateInput(),
+      TE.fromEither,
+      TE.chain(() => getExistingAppointment()),
+      TE.chain(existingBooking =>
+        appointment_dateTime
+          ? pipe(
+            findAppointmentByTimeSlot(appointment_dateTime, id),
+            TE.chain(isAvailable =>
+              isAvailable
+                ? TE.right(existingBooking)
+                : TE.left("Time slot already existing")
+            )
+          )
+          : TE.right(existingBooking)
+      ),
+      TE.chain(processAppointmentUpdate)
+    )();
 
-      // Delete google calendar event
-      if (checkBooking.eventId && isCreated) {
-        await calendarService.deleteEvent(checkBooking.eventId);
-      }
+    return pipe(
+      result,
+      E.match(
+        (error): AppointmentResult<Appointments> => ({ error, status: mapErrorToStatus(error) }),
+        (data): AppointmentResult<Appointments> => ({ data, status: 200 })
+      )
+    );
+  },
 
-      const booking = await this.prisma.appointments.update({
-        where: {
-          id: checkBooking.id,
-        },
-        data: {
-          ...checkBooking,
-          firstname: firstname || checkBooking.firstname,
-          lastname: lastname || checkBooking.lastname,
-          phone_number: phone_number || checkBooking.phone_number,
-          symptom: symptom || checkBooking.symptom,
-          appointment_dateTime:
-            appointment_dateTime || checkBooking.appointment_dateTime,
-          eventId: eventID || checkBooking.eventId,
-        },
-      });
+  // region cancelPatient
+  cancelAppointment: async (data: {
+    id: number;
+    firstname: string;
+    lastname: string;
+    phone_number: string;
+  }): Promise<AppointmentResult<any>> => {
+    const validation = validateRequiredFields(
+      data.id,
+      data.firstname,
+      data.lastname,
+      data.phone_number
+    );
 
-      return { data: booking, status: 200 };
-    } catch (error) {
-      if (error instanceof Error) {
-        return {
-          error: "Error while updating patient appointment service: " + error,
-          status: 500,
-        };
-      }
-      return { error: "An unexpected error occurred", status: 500 };
+    if (E.isLeft(validation)) {
+      return createResultFromEither(validation);
     }
-  }
 
-  async cancelAppointment(data: any) {
-    try {
-      if (!data.id || !data.firstname || !data.lastname || !data.phone_number) {
-        return { error: "Missing required fields", status: 400 };
-      }
-
-      const booking = await this.prisma.appointments.findFirst({
-        where: {
+    const findBooking = (): TE.TaskEither<string, Appointments> =>
+      pipe(
+        findAppointmentByParams({
           id: data.id,
           firstname: data.firstname,
           lastname: data.lastname,
           phone_number: data.phone_number,
-        },
-      });
+        }),
+        TE.chain(bookings =>
+          bookings.length > 0
+            ? TE.right(bookings[0])
+            : TE.left("Booking not found")
+        ),
+        TE.chain(booking =>
+          booking.appointment_status === Status.CANCELED
+            ? TE.left("Booking already canceled")
+            : TE.right(booking)
+        )
+      );
 
-      if (!booking) {
-        return { error: "Booking not found", status: 404 };
-      } else if (booking.appointment_status == Status.CANCELED) {
-        return { error: "Booking already cancled.", status: 304 };
-      }
+    const result = await pipe(
+      findBooking(),
+      TE.chain(booking =>
+        booking.eventId
+          ? pipe(
+            deleteGoogleCalendarEvent(booking.eventId),
+            TE.map(() => booking)
+          )
+          : TE.right(booking)
+      ),
+      TE.chain(booking =>
+        updateAppointment(booking.id, { appointment_status: Status.CANCELED })
+      ),
+      TE.map(formatAppointmentData)
+    )();
 
-      //Delete the google calendar event
-      if (booking.eventId) {
-        try {
-          await calendarService.deleteEvent(booking.eventId);
-        } catch (error) {
-          return {
-            error: "Error while deleting the Google Calendar event.",
-            status: 500,
-          };
-        }
-      }
-
-      //Update status to canceled in database
-      const updateBooking = await this.prisma.appointments.update({
-        where: {
-          id: booking.id,
-        },
-        data: {
-          appointment_status: Status.CANCELED,
-        },
-      });
-
-      const cancledBooking = {
-        id: updateBooking.id,
-        firstname: updateBooking.firstname,
-        lastname: updateBooking.lastname,
-        phone_number: updateBooking.phone_number,
-        symptom: updateBooking.symptom,
-        appointment_dateTime: updateBooking.appointment_dateTime,
-        appointment_status: Status[updateBooking.appointment_status] as string,
-      };
-
-      return { data: cancledBooking, status: 200 };
-    } catch (error) {
-      if (error instanceof Error) {
-        return {
-          error: "Error while deleting booking service:" + error,
-          status: 500,
-        };
-      }
-      return { error: "An unexpected error occurred", status: 500 };
-    }
-  }
-}
-
-export const appointmentService = new AppointmentService();
+    return pipe(
+      result,
+      E.match(
+        (error): AppointmentResult<Appointments> => ({ error, status: mapErrorToStatus(error) }),
+        (data): AppointmentResult<Appointments> => ({ data: data as Appointments, status: 200 })
+      )
+    );
+  },
+};

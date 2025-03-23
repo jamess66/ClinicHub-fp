@@ -31,7 +31,7 @@ const validateDateTimeFormat = (dateTime: string): boolean => {
 };
 
 class AppointmentController {
-  constructor() {}
+  constructor() { }
 
   async getAppointmentTimeSlot(req: Request, res: Response) {
     try {
@@ -93,7 +93,7 @@ class AppointmentController {
         return;
       }
 
-      const result = await appointmentService.creteBooking(
+      const result = await appointmentService.createBooking(
         firstname,
         lastname,
         phone_number,
@@ -199,8 +199,7 @@ class AppointmentController {
       } else {
         res.status(200).send(result.data);
         await sendLineNotification(
-          `✅ อัปเดตการนัดหมาย\n📌 ID: ${id}\n🕒 เวลาใหม่: ${
-            appointment_dateTime || "ไม่เปลี่ยนแปลง"
+          `✅ อัปเดตการนัดหมาย\n📌 ID: ${id}\n🕒 เวลาใหม่: ${appointment_dateTime || "ไม่เปลี่ยนแปลง"
           }\n📌 สถานะ: ${status || "ไม่เปลี่ยนแปลง"}`
         );
       }

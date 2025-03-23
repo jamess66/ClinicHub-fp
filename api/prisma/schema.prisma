@@ -11,6 +11,7 @@ generator client {
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 enum Status {
@@ -34,8 +35,8 @@ model Appointments {
 }
 
 model Feedback {
-  id           Int      @id @default(autoincrement()) 
-  rating       Int      
-  comment      String? 
-  createdAt    DateTime @default(now())
+  id        Int      @id @default(autoincrement())
+  rating    Int
+  comment   String?
+  createdAt DateTime @default(now())
 }

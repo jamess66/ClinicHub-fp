@@ -1,5 +1,9 @@
 import { google, calendar_v3 } from "googleapis";
 import dotenv from "dotenv";
+import { pipe } from "fp-ts/function";
+import * as E from "fp-ts/Either";
+import * as TE from "fp-ts/TaskEither";
+import { isDefined } from "../appointment/appointment.service";
 
 dotenv.config();
 
@@ -16,100 +20,168 @@ oAuth2Client.setCredentials({
 
 const calendar = google.calendar({ version: "v3", auth: oAuth2Client });
 
-class CalendarService {
-  async listEvents(): Promise<any[]> {
-    const now = new Date();
-    const response = await calendar.events.list({
-      calendarId: "primary",
-      timeMin: now.toISOString(),
-      timeMax: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days ahead
-      singleEvents: true,
-      orderBy: "startTime",
-    });
-    return response.data.items || [];
-  }
+// region Types
+type CalendarResult<T> = {
+  eventID?: string | undefined; status: number; data?: T; error?: string
+};
+type GoogleCalendarEvent = calendar_v3.Schema$Event;
+type GoogleCalendarEventResponse = calendar_v3.Schema$Event | null | undefined;
+type GoogleCalendarFreeBusyResponse = calendar_v3.Schema$FreeBusyResponse;
+type ValidationResult = E.Either<string, boolean>;
 
-  async createEvent(eventDetails: {
+// region Pure functions
+const validateTimeSlot = (eventStartTime: Date): ValidationResult =>
+  eventStartTime.getMinutes() % 15 === 0
+    ? E.right(true)
+    : E.left("Please select a time that is a multiple of 15 minutes.");
+
+const createDateTimeObject = (date: Date) => {
+  return {
+    year: date.getFullYear(),
+    month: date.getMonth() + 1,
+    day: date.getDate(),
+    hour: date.getHours(),
+    minute: date.getMinutes(),
+  };
+};
+
+const mapErrorToStatus = (error: string): number => {
+  if (error === "Time slot is busy." || error === "Please select a time that is a multiple of 15 minutes.") return 400;
+  if (error === "Event ID is required") return 400;
+  if (error === "Failed to delete event") return 500;
+  return 500;
+};
+
+const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<CalendarResult<T>> =>
+  pipe(
+    task,
+    TE.match(
+      (error: string): CalendarResult<T> => ({ error, status: mapErrorToStatus(error) }),
+      (data: T): CalendarResult<T> => ({ data, status: 200 })
+    )
+  )();
+
+// region Google Calendar operations
+const listEventsFromGoogleCalendar = (): TE.TaskEither<string, GoogleCalendarEvent[]> =>
+  TE.tryCatch(
+    async () => {
+      const now = new Date();
+      const response = await calendar.events.list({
+        calendarId: "primary",
+        timeMin: now.toISOString(),
+        timeMax: new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days ahead
+        singleEvents: true,
+        orderBy: "startTime",
+      });
+      return response.data.items || [];
+    },
+    (err) => `Error listing events: ${err}`
+  );
+
+const createEventInGoogleCalendar = (
+  calendarEvent: GoogleCalendarEvent
+): TE.TaskEither<string, string> =>
+  TE.tryCatch(
+    async () => {
+      const response = await calendar.events.insert({
+        calendarId: "primary",
+        requestBody: calendarEvent,
+      });
+      if (!response.data.id) {
+        throw new Error("Event created, but no event ID returned.");
+      }
+      return response.data.id;
+    },
+    (err) => `Error creating event: ${err}`
+  );
+
+const deleteEventFromGoogleCalendar = (eventId: string): TE.TaskEither<string, void> =>
+  pipe(
+    TE.tryCatch(
+      () =>
+        calendar.events.delete({
+          calendarId: "primary",
+          eventId,
+        }),
+      (err) => `Error deleting event: ${err}`
+    ),
+    TE.map(() => undefined)
+  );
+
+const checkFreeBusy = (
+  eventStartTime: Date,
+  eventEndTime: Date
+): TE.TaskEither<string, boolean> =>
+  TE.tryCatch(
+    async () => {
+      const freeBusy = await calendar.freebusy.query({
+        requestBody: {
+          timeMin: eventStartTime.toISOString(),
+          timeMax: eventEndTime.toISOString(),
+          timeZone: "GMT+07:00",
+          items: [{ id: "primary" }],
+        },
+      });
+      const busyTimes = freeBusy?.data?.calendars?.primary?.busy || [];
+      return busyTimes.length === 0;
+    },
+    (err) => `Error checking free/busy status: ${err}`
+  );
+
+// region Service
+export const calendarService = {
+  listEvents: (): Promise<CalendarResult<GoogleCalendarEvent[]>> =>
+    handleTaskResult(listEventsFromGoogleCalendar()),
+
+  createEvent: async (eventDetails: {
     year: number;
     month: number;
     day: number;
     hour: number;
     minute: number;
     description?: string;
-  }): Promise<{ eventID?: string; error?: string; status?: number }> {
+  }): Promise<CalendarResult<string>> => {
     const { year, month, day, hour, minute, description } = eventDetails;
-
-    // Create date in GMT+7 by subtracting 7 hours from UTC
     const eventStartTime = new Date(Date.UTC(year, month - 1, day, hour - 7, minute));
-    if (eventStartTime.getMinutes() % 15 !== 0) {
-      return {
-        error: "Please select a time that is a multiple of 15 minutes.",
-        status: 400,
-      };
-    }
-    const eventEndTime = new Date(
-      eventStartTime.getTime() + 15 * 60000 // Adjust for 15 minutes duration
-    );
+    const eventEndTime = new Date(eventStartTime.getTime() + 15 * 60000);
 
-    const calendarEvent: calendar_v3.Schema$Event = {
+    const calendarEvent: GoogleCalendarEvent = {
       summary: `Patient - ${hour}:${minute.toString().padStart(2, "0")}`,
       location: "Mongkol Clinic",
       description: description || "- No description -",
       colorId: "1",
       start: {
         dateTime: eventStartTime.toISOString(),
-        timeZone: "GMT+07:00"  // Using GMT+07:00 format
+        timeZone: "GMT+07:00",
       },
       end: {
         dateTime: eventEndTime.toISOString(),
-        timeZone: "GMT+07:00"  // Using GMT+07:00 format
+        timeZone: "GMT+07:00",
       },
     };
 
-    // Check for free/busy status
-    const freeBusy = await calendar.freebusy.query({
-      requestBody: {
-        timeMin: eventStartTime.toISOString(),
-        timeMax: eventEndTime.toISOString(),
-        timeZone: "GMT+07:00",  // Using GMT+07:00 format
-        items: [{ id: "primary" }],
-      },
-    });
+    const result = await pipe(
+      eventStartTime,
+      validateTimeSlot,
+      TE.fromEither,
+      TE.chain(() => checkFreeBusy(eventStartTime, eventEndTime)),
+      TE.chain((isFree) => (isFree ? TE.right(calendarEvent) : TE.left("Time slot is busy."))),
+      TE.chain(createEventInGoogleCalendar)
+    )();
 
-    const busyTimes = freeBusy?.data?.calendars?.primary?.busy || [];
-    if (busyTimes.length > 0) {
-      return { error: "Time slot is busy.", status: 400 };
-    }
+    return pipe(
+      result,
+      E.fold(
+        (error) => ({ error, status: mapErrorToStatus(error) }),
+        (data) => ({ data, status: 200, error: "" })
+      )
+    );
+  },
 
-    // Create the event
-    const response = await calendar.events.insert({
-      calendarId: "primary",
-      requestBody: calendarEvent,
-    });
-
-    if (!response.data.id) {
-      return { error: "Event created, but no event ID returned.", status: 400 };
-    }
-
-    return { eventID: response.data.id, status: 200 };
-  }
-
-  async deleteEvent(
-    eventId: string
-  ): Promise<void | { error?: string; message?: string; status?: number }> {
-    if (!eventId) {
+  deleteEvent: async (eventId: string): Promise<CalendarResult<void>> => {
+    if (!isDefined(eventId)) {
       return { error: "Event ID is required", status: 400 };
     }
-    try {
-      await calendar.events.delete({
-        calendarId: "primary",
-        eventId,
-      });
-      return { message: "Event deleted successfully", status: 200 };
-    } catch (error) {
-      return { error: "Failed to delete event", status: 500 };
-    }
-  }
-}
-
-export const calendarService = new CalendarService();
+    return handleTaskResult(deleteEventFromGoogleCalendar(eventId));
+  },
+};
