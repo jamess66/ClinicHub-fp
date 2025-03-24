@@ -237,7 +237,7 @@ export const appointmentService = {
     symptom: string,
     appointment_dateTime: string
   ): Promise<AppointmentResult<any>> => {
-    // Validation using composition
+    // Validation
     const validateInput = flow(
       (): ValidationResult => validateRequiredFields(firstname, lastname, phone_number, symptom, appointment_dateTime),
       E.chain(() => createDateValidator(true)(appointment_dateTime))

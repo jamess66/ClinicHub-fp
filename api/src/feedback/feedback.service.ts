@@ -1,69 +1,137 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient, Feedback } from "@prisma/client";
+import { pipe } from "fp-ts/function";
+import * as TE from "fp-ts/TaskEither";
+import * as E from "fp-ts/Either";
 
+// region Types
+type FeedbackResult<T> = { status: number; data?: T; error?: string };
+type ValidationResult = E.Either<string, boolean>;
+
+// region Constants
+const MIN_RATING = 1;
+const MAX_RATING = 3;
+
+// region Pure functions
+// Pure functions for validation
+const isValidRating = (rating: number): ValidationResult =>
+  rating >= MIN_RATING && rating <= MAX_RATING
+    ? E.right(true)
+    : E.left(`Invalid rating value (must be ${MIN_RATING}-${MAX_RATING})`);
+
+// region Database
+// Database operations
 const prisma = new PrismaClient();
 
-class FeedbackService {
-  async createFeedback(rating: number, comment: string) {
-    try {
-      // bad, moderate, good
-      if (!rating || rating < 1 || rating > 3) {
-        return { error: "Invalid rating value (must be 1-3)", status: 400 };
-      }
+const createFeedbackInDB = (rating: number, comment: string): TE.TaskEither<string, Feedback> =>
+  TE.tryCatch(
+    () => prisma.feedback.create({ data: { rating, comment } }),
+    (err) => `Error creating feedback: ${err}`
+  );
 
-      const feedback = await prisma.feedback.create({
-        data: {
-          rating,
-          comment: comment,
-        },
-      });
+const getAllFeedbackFromDB = (): TE.TaskEither<string, Feedback[]> =>
+  TE.tryCatch(
+    () => prisma.feedback.findMany({ orderBy: { createdAt: "desc" } }),
+    (err) => `Error fetching feedback: ${err}`
+  );
 
-      return { data: feedback, status: 201 };
-    } catch (error) {
-      console.error("Error creating feedback:", error);
-      return { error: "Error creating feedback", status: 500 };
-    }
+const getFeedbackByRatingFromDB = (rating: number): TE.TaskEither<string, Feedback[]> =>
+  TE.tryCatch(
+    () => prisma.feedback.findMany({ where: { rating }, orderBy: { createdAt: "desc" } }),
+    (err) => `Error fetching feedback by rating: ${err}`
+  );
+
+const deleteFeedbackFromDB = (id: number): TE.TaskEither<string, Feedback> =>
+  TE.tryCatch(
+    () => prisma.feedback.delete({ where: { id } }),
+    (err) => `Error deleting feedback: ${err}`
+  );
+
+const findFeedbackById = (id: number): TE.TaskEither<string, Feedback | null> =>
+  TE.tryCatch(
+    () => prisma.feedback.findUnique({ where: { id } }),
+    (err) => `Error finding feedback: ${err}`
+  );
+
+// region Utils
+// Helper for handling TaskEither results
+const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<FeedbackResult<T>> =>
+  pipe(
+    task,
+    TE.match(
+      (error: string): FeedbackResult<T> => ({ error, status: 500 }),
+      (data: T): FeedbackResult<T> => ({ data, status: 200 })
+    )
+  )();
+
+// Custom error status mapping
+const mapErrorToStatus = (error: string): number => {
+  if (error.includes("Invalid rating value")) return 400;
+  if (error.includes("Feedback not found")) return 404;
+  return 500;
+};
+
+// Helper for creating result from Either
+const createResultFromEither = <T>(either: E.Either<string, T>): FeedbackResult<T> => {
+  if (E.isLeft(either)) {
+    return { error: either.left, status: mapErrorToStatus(either.left) };
+  } else {
+    return { data: either.right, status: 200 };
   }
+};
 
-  async getAllFeedback() {
-    try {
-      const feedbackList = await prisma.feedback.findMany({
-        orderBy: { createdAt: "desc" },
-      });
-      return { data: feedbackList, status: 200 };
-    } catch (error) {
-      return { error: "Error fetching feedback", status: 500 };
+// region Services
+// Main service functions
+export const feedbackService = {
+  createFeedback: async (rating: number, comment: string): Promise<FeedbackResult<Feedback>> => {
+    const validation = isValidRating(rating);
+
+    if (E.isLeft(validation)) {
+      return createResultFromEither(validation);
     }
-  }
 
-  async getFeedbackByRating(rating: number) {
-    try {
-      const feedbackList = await prisma.feedback.findMany({
-        where: { rating: rating },
-        orderBy: { createdAt: "desc" },
-      });
+    return handleTaskResult(
+      pipe(
+        createFeedbackInDB(rating, comment),
+        TE.map(feedback => feedback),
+        TE.mapLeft(error => error)
+      )
+    );
+  },
 
-      return { data: feedbackList, status: 200 };
-    } catch (error) {
-      return { error: "Error fetching feedback by rating", status: 500 };
+  getAllFeedback: async (): Promise<FeedbackResult<Feedback[]>> =>
+    handleTaskResult(getAllFeedbackFromDB()),
+
+  getFeedbackByRating: async (rating: number): Promise<FeedbackResult<Feedback[]>> => {
+    const validation = isValidRating(rating);
+
+    if (E.isLeft(validation)) {
+      return createResultFromEither(validation);
     }
-  }
 
-  async deleteFeedback(id: number) {
-    try {
-      const existingFeedback = await prisma.feedback.findUnique({
-        where: { id },
-      });
-      if (!existingFeedback) {
-        return { error: "Feedback not found", status: 404 };
-      }
+    return handleTaskResult(getFeedbackByRatingFromDB(rating));
+  },
 
-      await prisma.feedback.delete({ where: { id } });
-      return { message: "Feedback deleted successfully", status: 200 };
-    } catch (error) {
-      console.error("Error deleting feedback:", error);
-      return { error: "Error deleting feedback", status: 500 };
-    }
-  }
-}
+  deleteFeedback: async (id: number): Promise<FeedbackResult<string>> => {
+    const checkExistingFeedback = (): TE.TaskEither<string, Feedback> =>
+      pipe(
+        findFeedbackById(id),
+        TE.chain(feedback =>
+          feedback ? TE.right(feedback) : TE.left("Feedback not found")
+        )
+      );
 
-export const feedbackService = new FeedbackService();
+    const result = await pipe(
+      checkExistingFeedback(),
+      TE.chain(() => deleteFeedbackFromDB(id)),
+      TE.map(() => "Feedback deleted successfully")
+    )();
+
+    return pipe(
+      result,
+      E.match(
+        (error): FeedbackResult<string> => ({ error, status: mapErrorToStatus(error) }),
+        (data): FeedbackResult<string> => ({ data, status: 200 })
+      )
+    );
+  },
+};
