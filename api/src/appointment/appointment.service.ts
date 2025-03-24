@@ -7,7 +7,6 @@ import * as TE from "fp-ts/TaskEither";
 import * as A from "fp-ts/Array";
 
 // region Types
-// Types
 type AppointmentResult<T> = { status: number; data?: T; error?: string }
 
 type GoogleCalendarResult = { eventID: string };
@@ -17,7 +16,6 @@ type ValidationResult = E.Either<string, boolean>;
 type AppointmentFields = (keyof Appointments)[];
 
 // region Constants
-// Constants
 const APPOINTMENT_FIELDS: AppointmentFields = [
   "firstname",
   "lastname",
@@ -34,7 +32,7 @@ const TIME_SLOT_VALIDATORS = [
 ];
 
 // region Pure functions
-// Pure functions for validation
+// validation
 export const isDefined = (value: any): boolean =>
   value !== undefined && value !== null && value !== '';
 
@@ -60,7 +58,7 @@ const createDateValidator = (required: boolean) => (date: string): ValidationRes
 const isFieldChanged = (dbData: Appointments) => (newData: Appointments): boolean =>
   APPOINTMENT_FIELDS.some(field => dbData[field] !== newData[field]);
 
-// Pure functions for data transformation
+// data transformation
 const formatAppointmentData = (appointment: Appointments) => ({
   id: appointment.id,
   firstname: appointment.firstname,
@@ -149,7 +147,6 @@ const updateAppointment = (
   );
 
 // region Google Calendar
-// Calendar operations
 const createGoogleCalendarEvent = (
   date: string,
   symptom: string
@@ -181,7 +178,7 @@ const deleteGoogleCalendarEvent = (eventId: string): TE.TaskEither<string, { mes
   );
 
 // region Utils
-// Helper for handling TaskEither results
+// handling TaskEither results
 const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<AppointmentResult<T>> =>
   pipe(
     task,
@@ -191,7 +188,7 @@ const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<Appointmen
     )
   )();
 
-// Custom error status mapping
+// error status mapping
 const mapErrorToStatus = (error: string): number => {
   if (error === "Missing required fields" ||
     error === "Invalid time slot" ||
@@ -206,7 +203,7 @@ const mapErrorToStatus = (error: string): number => {
   return 500;
 };
 
-// Helper for creating result from Either
+// creating result from Either
 const createResultFromEither = <T>(either: E.Either<string, T>): AppointmentResult<T> => {
   if (E.isLeft(either)) {
     return { error: either.left, status: mapErrorToStatus(either.left) };
@@ -216,7 +213,6 @@ const createResultFromEither = <T>(either: E.Either<string, T>): AppointmentResu
 };
 
 // region Services
-// Main service functions
 export const appointmentService = {
   // region getAppointmentTimeSlot
   getAppointmentTimeSlot: (date: string): Promise<AppointmentResult<{ appointment_dateTime: string }[]>> =>
@@ -333,7 +329,7 @@ export const appointmentService = {
     appointment_dateTime: string,
     status: string
   ): Promise<AppointmentResult<Appointments>> => {
-    // Validation using composition
+    // Validation
     const validateInput = flow(
       (): ValidationResult => validateRequiredFields(id, appointment_dateTime, status),
       E.chain(() => createDateValidator(false)(appointment_dateTime)),

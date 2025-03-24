@@ -8,6 +8,7 @@ import * as A from "fp-ts/Array";
 
 dotenv.config();
 
+// region Types
 // Types
 type EventDetails = {
   year: number;
@@ -24,6 +25,8 @@ type EventResponse = {
   status: number;
 };
 
+
+// region Google Calendar Setup
 // Initialize Google OAuth2 client
 const oAuth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
@@ -37,11 +40,11 @@ oAuth2Client.setCredentials({
 
 const calendar = google.calendar({ version: "v3", auth: oAuth2Client });
 
-// Helper functions
+// region Helper Functions
 const formatError = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-// Calendar service functions
+// region Calendar Service Functions
 const listEvents = (): TaskEither<string, any[]> =>
   pipe(
     tryCatch(
@@ -78,7 +81,7 @@ const createEventDateTime = (eventDetails: EventDetails): {
   eventEndTime: Date;
 } => {
   const { year, month, day, hour, minute } = eventDetails;
-  // Create date in GMT+7 by subtracting 7 hours from UTC
+  // Create date in GMT+7 by - 7 hours from UTC
   const eventStartTime = new Date(Date.UTC(year, month - 1, day, hour - 7, minute));
   const eventEndTime = new Date(eventStartTime.getTime() + 15 * 60000); // 15 minutes duration
 
@@ -215,9 +218,9 @@ const deleteEvent = (eventId: string): TaskEither<EventResponse, EventResponse> 
   );
 };
 
-// Export service functions
 export const calendarService = {
   listEvents,
   createEvent,
   deleteEvent
 };
+
