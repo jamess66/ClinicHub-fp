@@ -326,19 +326,22 @@ export const appointmentService = {
   // region updateBooking
   updateDoctorAppointment: async (
     id: number,
-    appointment_dateTime: string,
-    status: string
+    appointment_dateTime: string | undefined, // Make appointment_dateTime optional
+    status: string | undefined // Make status optional
   ): Promise<AppointmentResult<Appointments>> => {
     // Validation
     const validateInput = flow(
-      (): ValidationResult => validateRequiredFields(id, appointment_dateTime, status),
-      E.chain(() => createDateValidator(false)(appointment_dateTime)),
+      (): ValidationResult => validateRequiredFields(id),
+      E.chain(() => appointment_dateTime ? createDateValidator(false)(appointment_dateTime) : E.right(true)),
       E.chain(() =>
-        status && Status[status as keyof typeof Status] !== undefined
-          ? E.right(true)
-          : E.left("Invalid status")
+        status
+          ? Status[status as keyof typeof Status] !== undefined
+            ? E.right(true)
+            : E.left("Invalid status")
+          : E.right(true) // If status is not provided, it's valid
       )
     );
+
 
     const getExistingAppointment = (): TE.TaskEither<string, Appointments> =>
       pipe(
@@ -355,11 +358,12 @@ export const appointmentService = {
 
     const processAppointmentUpdate = (existingBooking: Appointments) => {
       const newStatus = status ? Status[status as keyof typeof Status] : existingBooking.appointment_status;
-      const newDateTime = appointment_dateTime || existingBooking.appointment_dateTime;
+      // Only update the date if appointment_dateTime is provided
+      const newDateTime = appointment_dateTime !== undefined ? appointment_dateTime : existingBooking.appointment_dateTime;
 
       const newData: Appointments = {
         ...existingBooking,
-        appointment_dateTime: newDateTime,
+        ...(appointment_dateTime !== undefined && { appointment_dateTime: newDateTime }), // Conditionally update appointment_dateTime
         appointment_status: newStatus,
       };
 
@@ -368,10 +372,11 @@ export const appointmentService = {
       }
 
       return pipe(
-        createGoogleCalendarEvent(newDateTime, existingBooking.symptom),
-        TE.chain(eventID => eventID ? TE.right(eventID) : TE.left("Failed to create calendar event")),
+        // Only create a new calendar event if appointment_dateTime is provided
+        appointment_dateTime !== undefined ? createGoogleCalendarEvent(newDateTime, existingBooking.symptom) : TE.right({ eventID: existingBooking.eventId || "" }),
+        TE.chain(eventID => eventID.eventID ? TE.right(eventID) : TE.left("Failed to create calendar event")),
         TE.chain(({ eventID }) =>
-          existingBooking.eventId
+          existingBooking.eventId && appointment_dateTime !== undefined // Only delete if there was an old event and we are updating the date
             ? pipe(
               deleteGoogleCalendarEvent(existingBooking.eventId),
               TE.map(() => eventID)
@@ -380,7 +385,7 @@ export const appointmentService = {
         ),
         TE.chain(eventID =>
           updateAppointment(id, {
-            appointment_dateTime: appointment_dateTime || undefined,
+            ...(appointment_dateTime !== undefined && { appointment_dateTime: appointment_dateTime }), // Conditionally update appointment_dateTime
             appointment_status: status ? Status[status as keyof typeof Status] : undefined,
             eventId: eventID,
           })
