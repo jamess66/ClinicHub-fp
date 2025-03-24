@@ -27,7 +27,7 @@ type EventResponse = {
 
 
 // region Google Calendar Setup
-// Initialize Google OAuth2 client
+// init Google OAuth2 client
 const oAuth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET
@@ -81,7 +81,7 @@ const createEventDateTime = (eventDetails: EventDetails): {
   eventEndTime: Date;
 } => {
   const { year, month, day, hour, minute } = eventDetails;
-  // Create date in GMT+7 by - 7 hours from UTC
+  // create date in GMT+7 by - 7 hours from UTC
   const eventStartTime = new Date(Date.UTC(year, month - 1, day, hour - 7, minute));
   const eventEndTime = new Date(eventStartTime.getTime() + 15 * 60000); // 15 minutes duration
 

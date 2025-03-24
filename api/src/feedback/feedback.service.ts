@@ -12,7 +12,7 @@ const MIN_RATING = 1;
 const MAX_RATING = 3;
 
 // region Pure functions
-// Pure functions for validation
+// validation
 const isValidRating = (rating: number): ValidationResult =>
   rating >= MIN_RATING && rating <= MAX_RATING
     ? E.right(true)
@@ -53,7 +53,7 @@ const findFeedbackById = (id: number): TE.TaskEither<string, Feedback | null> =>
   );
 
 // region Utils
-// Helper for handling TaskEither results
+// handling TaskEither results
 const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<FeedbackResult<T>> =>
   pipe(
     task,
@@ -63,14 +63,14 @@ const handleTaskResult = <T>(task: TE.TaskEither<string, T>): Promise<FeedbackRe
     )
   )();
 
-// Custom error status mapping
+// error status mapping
 const mapErrorToStatus = (error: string): number => {
   if (error.includes("Invalid rating value")) return 400;
   if (error.includes("Feedback not found")) return 404;
   return 500;
 };
 
-// Helper for creating result from Either
+//creating result from Either
 const createResultFromEither = <T>(either: E.Either<string, T>): FeedbackResult<T> => {
   if (E.isLeft(either)) {
     return { error: either.left, status: mapErrorToStatus(either.left) };
@@ -80,7 +80,6 @@ const createResultFromEither = <T>(either: E.Either<string, T>): FeedbackResult<
 };
 
 // region Services
-// Main service functions
 export const feedbackService = {
   createFeedback: async (rating: number, comment: string): Promise<FeedbackResult<Feedback>> => {
     const validation = isValidRating(rating);

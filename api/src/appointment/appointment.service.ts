@@ -358,12 +358,11 @@ export const appointmentService = {
 
     const processAppointmentUpdate = (existingBooking: Appointments) => {
       const newStatus = status ? Status[status as keyof typeof Status] : existingBooking.appointment_status;
-      // Only update the date if appointment_dateTime is provided
       const newDateTime = appointment_dateTime !== undefined ? appointment_dateTime : existingBooking.appointment_dateTime;
 
       const newData: Appointments = {
         ...existingBooking,
-        ...(appointment_dateTime !== undefined && { appointment_dateTime: newDateTime }), // Conditionally update appointment_dateTime
+        ...(appointment_dateTime !== undefined && { appointment_dateTime: newDateTime }),
         appointment_status: newStatus,
       };
 
@@ -372,11 +371,10 @@ export const appointmentService = {
       }
 
       return pipe(
-        // Only create a new calendar event if appointment_dateTime is provided
         appointment_dateTime !== undefined ? createGoogleCalendarEvent(newDateTime, existingBooking.symptom) : TE.right({ eventID: existingBooking.eventId || "" }),
         TE.chain(eventID => eventID.eventID ? TE.right(eventID) : TE.left("Failed to create calendar event")),
         TE.chain(({ eventID }) =>
-          existingBooking.eventId && appointment_dateTime !== undefined // Only delete if there was an old event and we are updating the date
+          existingBooking.eventId && appointment_dateTime !== undefined
             ? pipe(
               deleteGoogleCalendarEvent(existingBooking.eventId),
               TE.map(() => eventID)
@@ -385,7 +383,7 @@ export const appointmentService = {
         ),
         TE.chain(eventID =>
           updateAppointment(id, {
-            ...(appointment_dateTime !== undefined && { appointment_dateTime: appointment_dateTime }), // Conditionally update appointment_dateTime
+            ...(appointment_dateTime !== undefined && { appointment_dateTime: appointment_dateTime }),
             appointment_status: status ? Status[status as keyof typeof Status] : undefined,
             eventId: eventID,
           })
